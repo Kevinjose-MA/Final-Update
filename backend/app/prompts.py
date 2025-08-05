@@ -58,20 +58,24 @@ def build_mistral_prompt(query: str, clauses: list, max_tokens: int = 1500) -> s
 
 
 # 🔹 Multi-question batch prompt builder
-def build_batch_prompt(questions: list, clauses: list, max_tokens: int = 1800) -> str:
-    clause_text = _trim_clauses(clauses, max_tokens)
-    question_block = "\n".join([f"Q{i+1}: {q.strip()}" for i, q in enumerate(questions)])
+def build_batch_prompt_with_context(questions: list, clause_map: dict, max_tokens: int = 1800) -> str:
+    clause_text = _trim_clauses(sum(clause_map.values(), []), max_tokens)
+
+    question_block = "\n".join([
+        f"Q{i+1}: {q.strip()}\nContext: {clause_map.get(q, [{'clause': ''}])[0]['clause'][:250]}"
+        for i, q in enumerate(questions)
+    ])
 
     return f"""
-You are an expert insurance assistant. Read the policy clauses below and answer the user's questions strictly using only the clause content.
+You are an expert insurance assistant. Read the policy clauses and answer each question strictly using only the clause content.
 
 Policy Clauses:
 {clause_text}
 
-User Questions:
+User Questions with Context:
 {question_block}
 
-Answer in this JSON format:
+Respond with answers in this JSON format:
 {{
   "Q1": "answer to question 1",
   "Q2": "answer to question 2",
@@ -79,7 +83,8 @@ Answer in this JSON format:
 }}
 
 Instructions:
-- Be concise and factual (max 25 words per answer).
-- Do NOT guess, assume, or include outside knowledge.
-- Respond ONLY with the raw JSON (no markdown or text).
+- Start with 'Yes' or 'No' when applicable.
+- Max 25 words per answer.
+- No assumptions or outside knowledge.
+- Respond ONLY with raw JSON.
 """.strip()

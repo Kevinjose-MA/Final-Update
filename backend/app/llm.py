@@ -13,7 +13,7 @@ api_key = os.getenv("GEMINI_API")
 genai.configure(api_key=api_key)
 
 # Use Gemini 1.5 Flash (Fast + Cheap)
-genai_model = genai.GenerativeModel("models/gemini-1.5-flash")
+genai_model = genai.GenerativeModel("models/gemini-2.5-flash")
 
 # Sanitize Gemini Output
 def _sanitize_llm_output(raw: str) -> str:

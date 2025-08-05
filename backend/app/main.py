@@ -69,18 +69,22 @@ def save_clause_cache(url: str, clauses: List[Dict[str, str]]):
     with open(cache_path, "w", encoding="utf-8") as f:
         json.dump(clauses, f, indent=2, ensure_ascii=False)
 
-def is_probably_insurance_policy(clauses: List[Dict[str, str]]) -> bool:
-    insurance_keywords = {
-        "coverage", "hospitalization", "sum insured", "premium", "pre-existing",
-        "benefit", "exclusion", "waiting period", "treatment", "illness", "policy"
+def is_probably_insurance_policy(clauses: List[Dict], min_matches: int = 3) -> bool:
+    policy_keywords = {
+        "policy", "insurance", "sum insured", "coverage", "benefit",
+        "premium", "claim", "hospitalization", "waiting period", "pre-existing"
     }
+
     match_count = 0
-    for clause in clauses[:40]:
+    for clause in clauses[:40]:  # Only check first 40 clauses
         text = clause.get("clause", "").lower()
-        matches = sum(1 for word in insurance_keywords if word in text)
-        if matches >= 2:
-            match_count += 1
-    return match_count >= 5
+        for kw in policy_keywords:
+            if kw in text:
+                match_count += 1
+                break  # avoid counting multiple keywords in one clause
+
+    print(f"🕵️ Insurance keyword matches found: {match_count}")
+    return match_count >= min_matches
 
 def build_faiss_index(clauses: List[Dict]) -> tuple:
     texts = [c["clause"] for c in clauses]
@@ -237,19 +241,31 @@ from concurrent.futures import ThreadPoolExecutor
 
 def get_top_clauses(question: str, index, clause_texts: List[str]) -> List[str]:
     question_embedding = model.encode([question])
-    _, indices = index.search(np.array(question_embedding).astype(np.float32), k=20)
-    top_clauses = [clause_texts[i] for i in indices[0]]
+    _, indices = index.search(np.array(question_embedding).astype(np.float32), k=30)
+    top_faiss_clauses = [clause_texts[i] for i in indices[0]]
 
     keywords = extract_keywords(question)
-    keyword_matches = [c for c in clause_texts if sum(k in c.lower() for k in keywords) >= 2]
+    keyword_scores = {
+        clause: sum(k in clause.lower() for k in keywords)
+        for clause in clause_texts
+    }
+    top_keyword_clauses = sorted(
+        keyword_scores.items(),
+        key=lambda x: x[1],
+        reverse=True
+    )[:20]
 
-    combined = list(dict.fromkeys(top_clauses + keyword_matches))
-    # Add near bottom of get_top_clauses()
-    if any(term in question.lower() for term in ["not covered", "excluded", "infertility", "vasectomy", "contraceptive", "bariatric", "cosmetic", "weight loss", "sterilization"]):
-            exclusion_matches = [c for c in clause_texts if any(term in c.lower() for term in ["not covered", "excluded", "will not cover", "not payable"])]
-            combined = exclusion_matches + combined  # boost exclusions
+    keyword_clauses = [c for c, _ in top_keyword_clauses]
+    combined = list(dict.fromkeys(top_faiss_clauses + keyword_clauses))
 
-    return combined[:10]
+    # Boost exclusions if detected
+    if any(word in question.lower() for word in ["not covered", "excluded", "infertility", "vasectomy", "cosmetic", "sterilization", "bariatric", "weight loss"]):
+        exclusion_clauses = [
+            c for c in clause_texts if re.search(r"(not\s+covered|excluded|not\s+payable|no\s+benefit)", c, re.I)
+        ]
+        combined = exclusion_clauses + combined
+
+    return combined[:12]
 
 
 
