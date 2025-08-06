@@ -1,46 +1,91 @@
-# app/parse_query.py
-
 import re
-from typing import Dict, List
+from collections import Counter
+from typing import List, Dict,Union
 
-def parse_query(query: str) -> Dict:
+
+def extract_dynamic_keywords_from_clauses(clauses: List[Dict[str, str]], top_k: int = 20) -> Dict[str, List[str]]:
     """
-    Parses a health insurance-related query to extract semantic tags.
+    Extracts a dynamic keyword_map based on the most frequent meaningful words
+    in the document, to support context-aware clause matching.
 
     Args:
-        query (str): User input question or phrase.
+        clauses: List of dictionaries with "clause" as the key.
+        top_k: Number of top keywords to return.
 
     Returns:
-        dict: {
-            "original_query": str,
-            "tags": List[str],
-            "has_medical": bool,
-            "has_benefit": bool
-        }
+        Dictionary: {keyword -> list of related words from nearby clause content}
     """
-    query = query.strip().lower()
+    word_freq = Counter()
+    clause_word_map = {}
 
-    keyword_map = {
-        "surgery": ["surgery", "operation", "procedure"],
-        "maternity": ["maternity", "pregnancy", "childbirth"],
-        "hospital": ["hospital", "facility", "room rent", "icu"],
-        "waiting_period": ["waiting period", "eligibility", "initial wait"],
-        "pre_existing": ["pre-existing", "ped", "pre existing"],
-        "discount": ["ncd", "discount", "no claim bonus"],
-        "ayush": ["ayurveda", "homeopathy", "ayush", "unani"],
-        "organ_donor": ["organ donor", "transplant", "donation"],
-        "grace_period": ["grace period", "payment grace", "premium grace", "due date", "late payment"]
+    for clause_obj in clauses:
+        text = clause_obj.get("clause", "").lower()
+        tokens = re.findall(r'\b[a-z]{3,}\b', text)
+        for token in tokens:
+            word_freq[token] += 1
+            clause_word_map.setdefault(token, []).append(text)
+
+    stopwords = {
+        "the", "and", "that", "with", "from", "shall", "have", "will", "for",
+        "are", "any", "this", "all", "not", "can", "per", "may", "under", "been",
+        "upon", "there", "when", "into", "such", "here", "each", "their", "than"
     }
 
-    found_tags: List[str] = []
+    # Select top frequent non-stopword tokens
+    top_words = [word for word, _ in word_freq.most_common(100) if word not in stopwords][:top_k]
 
-    for tag, terms in keyword_map.items():
-        if any(re.search(rf"\b{re.escape(term)}\b", query) for term in terms):
-            found_tags.append(tag)
+    keyword_map = {}
+    for word in top_words:
+        related_clauses = clause_word_map.get(word, [])[:5]
+        nearby_words = set()
+        for phrase in related_clauses:
+            nearby_words.update(w for w in phrase.split() if len(w) > 4)
+        keyword_map[word] = list({word} | nearby_words)
+
+    return keyword_map
+
+
+def parse_query_with_dynamic_map(query: str, clauses: List[Union[str, Dict[str, str]]], top_k: int = 3) -> Dict:
+    """
+    Ranks top-matching clauses based on shared keywords between the query and clauses.
+
+    Args:
+        query: Natural language question.
+        clauses: List of clause dicts or plain strings.
+        top_k: Number of top matching clauses to return.
+
+    Returns:
+        {
+            "tags": [...],  # extracted keywords from the query
+            "clauses": [{ "clause": "..." }, ...]  # top-k matched clauses
+        }
+    """
+    # Extract keywords from query
+    query_keywords = re.findall(r'\b[a-zA-Z]{3,}\b', query.lower())
+    keyword_counter = Counter(query_keywords)
+
+    scored = []
+
+    for clause in clauses:
+        # Normalize clause text
+        if isinstance(clause, dict):
+            clause_text = clause.get("clause", "").lower()
+        else:
+            clause_text = str(clause).lower()
+
+        # Simple keyword match scoring
+        score = sum(clause_text.count(k) for k in keyword_counter)
+
+        if score > 0:
+            scored.append((score, {"clause": clause_text}))
+
+    # ✅ Fix: Sort by score only, descending
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # Select top-k
+    top_clauses = [item for _, item in scored[:top_k]]
 
     return {
-        "original_query": query,
-        "tags": found_tags,
-        "has_medical": any(tag in found_tags for tag in {"surgery", "maternity", "pre_existing", "organ_donor"}),
-        "has_benefit": any(tag in found_tags for tag in {"discount", "ayush"})
+        "tags": list(keyword_counter.keys()),
+        "clauses": top_clauses
     }

@@ -7,12 +7,14 @@ from email import policy
 from bs4 import BeautifulSoup
 from io import BytesIO
 from transformers import AutoTokenizer
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 import re
 import os
 import hashlib
+import json
 
-# Load tokenizer once (512-token limit for Gemini/Mistral)
-tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+# Load tokenizer
+tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L12-v2")
 
 # --- 📄 File Extractors ---
 
@@ -38,27 +40,70 @@ def extract_text_from_eml(file_bytes: bytes) -> str:
                 return BeautifulSoup(part.get_content(), "html.parser").get_text()
     return msg.get_content()
 
-# --- ✂️ Clause Splitter ---
+# --- 🔍 Clause Extraction ---
+
+SECTION_KEYWORDS = [
+    "exclusions", "inclusions", "coverage", "benefits", "definitions",
+    "terms", "conditions", "waiting period", "claim process", "eligibility",
+    "sum insured", "room rent", "deductible", "co-payment", "maternity",
+    "newborn", "renewal", "termination", "cashless", "sub-limits",
+    "disease", "hospitalization", "ambulance", "pre-existing", "day care"
+]
+
+def is_heading(line: str) -> bool:
+    line = line.strip().lower()
+    return (
+        len(line) < 120 and (
+            line.isupper() or
+            re.match(r"^\d+[\.\)]\s", line) or
+            any(keyword in line for keyword in SECTION_KEYWORDS)
+        )
+    )
+
+def extract_tags(text):
+    words = re.findall(r'\w+', text.lower())
+    return list(set(w for w in words if len(w) > 3 and w not in ENGLISH_STOP_WORDS))
 
 def split_into_clauses(text: str):
     text = text.replace('\r', '').replace('\xa0', ' ').strip()
     raw_lines = [line.strip() for line in text.split('\n') if line.strip()]
-    
+
     clauses = []
     buffer = ""
+    current_heading = None
 
     for line in raw_lines:
-        buffer += " " + line.strip()
-        # Close clause if sentence ends or paragraph is long enough
+        if is_heading(line):
+            if buffer:
+                clauses.append({
+                    "clause": buffer.strip(),
+                    "section": current_heading or "Unknown",
+                    "tags": extract_tags(buffer)
+                })
+                buffer = ""
+            current_heading = line.strip()
+        else:
+            buffer += " " + line
+
+        # End clause if long or ends with period/semicolon
         if (
-            len(buffer) > 400 and buffer.strip()[-1:] in {".", ";", ":"}
-        ) or len(buffer.split()) > 80:
-            clauses.append({"clause": buffer.strip()})
+            len(buffer.split()) > 150 or
+            (len(buffer) > 600 and buffer.strip()[-1:] in {".", ";", ":"})
+        ):
+            clauses.append({
+                "clause": buffer.strip(),
+                "section": current_heading or "Unknown",
+                "tags": extract_tags(buffer)
+            })
             buffer = ""
 
     if buffer.strip():
-        clauses.append({"clause": buffer.strip()})
-    
+        clauses.append({
+            "clause": buffer.strip(),
+            "section": current_heading or "Unknown",
+            "tags": extract_tags(buffer)
+        })
+
     return clauses
 
 def filter_boilerplate_clauses(clauses):
@@ -68,32 +113,10 @@ def filter_boilerplate_clauses(clauses):
         and len(c["clause"].split()) >= 10
     ]
 
-
-
-def merge_short_clauses(clauses, min_char_len=100):
-    merged = []
-    buffer = ""
-
-    for c in clauses:
-        text = c["clause"].strip()
-        if len(text) < min_char_len or not text.endswith(('.', ':', ';')):
-            buffer += " " + text
-        else:
-            if buffer:
-                merged.append({"clause": buffer.strip()})
-                buffer = ""
-            merged.append({"clause": text})
-
-    if buffer:
-        merged.append({"clause": buffer.strip()})
-
-    return merged
-
-
-
 # --- 🌐 Entry Point ---
 
 def extract_clauses_from_url(url: str):
+    print(f"🌐 Downloading file from: {url}")
     response = requests.get(url)
     file_bytes = response.content
     content_type = response.headers.get("Content-Type")
@@ -116,55 +139,24 @@ def extract_clauses_from_url(url: str):
     else:
         raw_text = extract_text_from_pdf(file_bytes)
 
+    print("✂️ Splitting into clauses...")
     clauses = split_into_clauses(raw_text)
-    clauses = merge_short_clauses(clauses)
-    clauses = filter_boilerplate_clauses(clauses) 
+    clauses = filter_boilerplate_clauses(clauses)
 
-
-    # 🔻 Clamp if too many
-    if len(clauses) > 1000:
-        print(f"⚠️ Too any clauses ({len(clauses)}), trimming to 300")
-        clauses = clauses[:1000]
-
-    # Heuristic policy detection
-    policy_keywords = {
-        "policy", "insurance", "sum insured", "coverage", "benefit",
-        "premium", "claim", "hospitalization", "waiting period", "pre-existing",
-        "health cover", "cashless", "inpatient", "exclusion", "deductible",
-        "disclosure", "third-party administrator", "network hospital",
-        "room rent", "ambulance", "domiciliary", "post-hospitalization",
-        "pre-hospitalization", "AYUSH", "daycare", "surgery", "mediclaim",
-        "co-payment", "renewal", "lifetime", "claim settlement", "grace period"
-    }
-
-    match_count = 0
-    matched_keywords = set()
-    for clause in clauses[:40]:
-        text = clause.get("clause", "").lower()
-        for kw in policy_keywords:
-            if kw in text:
-                match_count += 1
-                matched_keywords.add(kw)
+    if len(clauses) > 2000:
+        print(f"⚠️ Too many clauses ({len(clauses)}), trimming to 1500")
+        clauses = clauses[:1500]
 
     # Cache key
     cache_key = hashlib.md5(url.encode()).hexdigest()
     cache_path = os.path.join("clause_cache", f"{cache_key}.json")
 
-    # Decide to keep or skip
-    if match_count < 4:
-        if os.path.exists(cache_path):
-            print(f"⚠️ Low match count ({match_count}) but trusting existing cache for: {url}")
-            return clauses
-        else:
-            print(f"❌ Skipped non-policy document (matched {match_count} keywords): {url}")
-            print(f"🔍 Matched keywords: {matched_keywords}")
-            print("🧪 Sample clauses (first 5):")
-            for i, clause in enumerate(clauses[:5]):
-                print(f"[{i+1}] {clause.get('clause')[:150]}")
-            if os.path.exists(cache_path):
-                os.remove(cache_path)
-                print(f"🧹 Removed existing clause cache: {cache_path}")
-            return []
+    os.makedirs("clause_cache", exist_ok=True)
 
-    print(f"✅ Document accepted with {match_count} keyword matches: {matched_keywords}")
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(clauses, f, indent=2, ensure_ascii=False)
+        print(f"✅ Cached {len(clauses)} clauses to {cache_path}")
+
+    print(f"📄 Final clause count: {len(clauses)}")
+    print(f"🔑 Cache key: {cache_key}")
     return clauses

@@ -1,12 +1,14 @@
 from transformers import AutoTokenizer
 
-# Load tokenizer once globally
+# Load tokenizer globally (used for token count trimming)
 tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
 
-# 🔹 Template for single question prompt
-#prompts.py
+# --------------------------------------
+# 🔹 TEMPLATE for Single-Question Prompt
+# --------------------------------------
+
 MISTRAL_SYSTEM_PROMPT_TEMPLATE = """
-You are a helpful insurance assistant. Your task is to read the given policy clauses and answer the user's question clearly and naturally, using only the information in the clauses.
+You are a helpful assistant. Your task is to read the given document clauses and answer the user's question clearly and naturally, using only the information in the clauses.
 
 Instructions:
 - Start your answer with "Yes" or "No", based only on what's explicitly stated.
@@ -14,31 +16,40 @@ Instructions:
 - Do NOT guess, assume, or include outside knowledge.
 - Do NOT mention clause numbers, section names, or formatting.
 - Be specific, complete, and keep the answer under 4 lines (ideally <25 words).
-- Include key details such as conditions, limits, waiting periods, or exclusions.
+- Include key details such as conditions, limits, exclusions, etc.
+- If the answer is partially implied, infer it cautiously and explain using clause text.
+- If exact phrases are missing, use semantic meaning or synonyms to match the question with clause content.
 
 Output format:
-{{
-  "answer": "<A full-sentence, clear answer starting with 'Yes' or 'No', using only clause content>"
-}}
+{
+  "answer": "<Clear answer starting with 'Yes' or 'No', using only clause content>"
+}
 
 User Question:
 {query}
 
-Relevant Policy Clauses:
+Relevant Clauses:
 {clauses}
 
-Respond with only the raw JSON (no markdown, no extra text, no backticks).
+Respond with only the raw JSON (no markdown, no backticks).
 """.strip()
 
 
+# --------------------------------------
+# 🔹 CLAUSE TRIMMER BY TOKEN LENGTH
+# --------------------------------------
 
-# 🔹 Utility: Trim clauses by token limit
 def _trim_clauses(clauses: list, max_tokens: int) -> str:
+    """
+    Joins clause text up to the max token limit for the LLM input.
+    """
     trimmed = []
     total_tokens = 0
 
     for clause_obj in clauses:
         clause = clause_obj.get("clause", "").strip()
+        if not clause:
+            continue
         tokens = len(tokenizer.tokenize(clause))
         if total_tokens + tokens > max_tokens:
             break
@@ -48,8 +59,14 @@ def _trim_clauses(clauses: list, max_tokens: int) -> str:
     return "\n\n".join(trimmed)
 
 
-# 🔹 Single-question prompt builder
-def build_mistral_prompt(query: str, clauses: list, max_tokens: int = 1500) -> str:
+# --------------------------------------
+# 🔹 SINGLE QUESTION PROMPT BUILDER
+# --------------------------------------
+
+def build_mistral_prompt(query: str, clauses: list, max_tokens: int = 1800) -> str:
+    """
+    Builds prompt for a single user query using relevant clauses.
+    """
     clause_text = _trim_clauses(clauses, max_tokens)
     return MISTRAL_SYSTEM_PROMPT_TEMPLATE.format(
         query=query.strip(),
@@ -57,25 +74,43 @@ def build_mistral_prompt(query: str, clauses: list, max_tokens: int = 1500) -> s
     )
 
 
-# 🔹 Multi-question batch prompt builder
-def build_batch_prompt_with_context(questions: list, clause_map: dict, max_tokens: int = 1800) -> str:
-    clause_text = _trim_clauses(sum(clause_map.values(), []), max_tokens)
+# --------------------------------------
+# 🔹 BATCH MULTI-QUESTION PROMPT BUILDER
+# --------------------------------------
 
+def build_batch_prompt(questions: list, clause_map: dict, max_tokens: int = 1800) -> str:
+    """
+    Builds prompt for multiple questions with clause context.
+    clause_map: Dict[question -> List[clause_obj]]
+    """
+    # Collect unique clauses from all questions
+    all_clauses = set()
+    for clause_list in clause_map.values():
+        for clause in clause_list:
+            text = clause.get("clause", "").strip()
+            if text:
+                all_clauses.add(text)
+
+    # Trim to max tokens
+    clause_text = _trim_clauses([{'clause': c} for c in all_clauses], max_tokens)
+
+    # Format questions
     question_block = "\n".join([
-        f"Q{i+1}: {q.strip()}\nContext: {clause_map.get(q, [{'clause': ''}])[0]['clause'][:250]}"
+        f"Q{i+1}: {q.strip()}"
         for i, q in enumerate(questions)
     ])
 
+    # Final prompt
     return f"""
-You are an expert insurance assistant. Read the policy clauses and answer each question strictly using only the clause content.
+You are a reliable assistant. Read the document clauses below and answer the user's questions using only the information in those clauses.
 
-Policy Clauses:
+Document Clauses:
 {clause_text}
 
-User Questions with Context:
+User Questions:
 {question_block}
 
-Respond with answers in this JSON format:
+Output format:
 {{
   "Q1": "answer to question 1",
   "Q2": "answer to question 2",
@@ -83,8 +118,11 @@ Respond with answers in this JSON format:
 }}
 
 Instructions:
-- Start with 'Yes' or 'No' when applicable.
-- Max 25 words per answer.
-- No assumptions or outside knowledge.
-- Respond ONLY with raw JSON.
+- Be concise and factual (max 25 words per answer).
+- Start each answer with "Yes" or "No" based only on what's clearly stated.
+- Use reasoning based on synonyms and meanings, not just exact phrase match.
+- Do NOT guess or include outside knowledge.
+- If the answer is not found, write: "No matching clause found."
+- Use natural, easy-to-understand language.
+- Respond ONLY with the raw JSON (no markdown or extra text).
 """.strip()

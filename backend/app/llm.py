@@ -2,21 +2,25 @@
 
 import os
 import json
-import google.generativeai as genai
+import asyncio
+from typing import List, Dict
 from dotenv import load_dotenv
+import google.generativeai as genai
 from app.prompts import MISTRAL_SYSTEM_PROMPT_TEMPLATE, build_mistral_prompt, build_batch_prompt
 
-
-# Load Gemini API Key
+# Load environment
 load_dotenv()
 api_key = os.getenv("GEMINI_API")
 genai.configure(api_key=api_key)
 
-# Use Gemini 1.5 Flash (Fast + Cheap)
-genai_model = genai.GenerativeModel("models/gemini-1.5-flash")
+# Initialize Gemini model
+genai_model = genai.GenerativeModel("models/gemini-2.5-flash")
 
-# Sanitize Gemini Output
+
 def _sanitize_llm_output(raw: str) -> str:
+    """
+    Strips codeblock wrappers, whitespace, and markdown formatting.
+    """
     raw = raw.strip()
     if raw.startswith("```json"):
         raw = raw[7:]
@@ -24,7 +28,7 @@ def _sanitize_llm_output(raw: str) -> str:
         raw = raw[3:]
     return raw.strip("`").strip()
 
-# Single-question prompt
+
 def query_mistral_with_clauses(question: str, clauses: list) -> dict:
     prompt = build_mistral_prompt(question, clauses)
 
@@ -55,7 +59,7 @@ def query_mistral_with_clauses(question: str, clauses: list) -> dict:
             "explanation": str(e)
         }
 
-# Batched multi-question prompt
+
 def query_mistral_batch(questions: list, clauses: list) -> dict:
     prompt = build_batch_prompt(questions, clauses)
 
@@ -71,7 +75,6 @@ def query_mistral_batch(questions: list, clauses: list) -> dict:
         clean = _sanitize_llm_output(response.text)
         parsed = json.loads(clean)
 
-        # Ensure response matches expected format
         if isinstance(parsed, dict) and all(k.startswith("Q") for k in parsed.keys()):
             return parsed
         else:
@@ -83,3 +86,64 @@ def query_mistral_batch(questions: list, clauses: list) -> dict:
     except Exception as e:
         print(f"❌ LLM Error (batch): {e}")
         return {f"Q{i+1}": "LLM processing error." for i in range(len(questions))}
+
+
+async def warmup_llm():
+    try:
+        prompt = """
+        You are a helpful assistant. Answer clearly.
+        Format:
+        {
+          "Q1": { "answer": "Sample answer", "clauses": "Relevant clauses here" }
+        }
+        """
+        response = await asyncio.to_thread(
+            genai_model.generate_content,
+            contents=[{"role": "user", "parts": [prompt]}],
+            generation_config={"response_mime_type": "application/json"},
+        )
+        print("✅ Gemini warmup successful.")
+        if hasattr(response, "usage_metadata"):
+            print(f"🔢 Warmup token usage: {response.usage_metadata.total_token_count}")
+    except Exception as e:
+        print(f"❌ Gemini warmup failed: {e}")
+
+
+async def call_llm_batch(prompts: List[str]) -> Dict[str, Dict[str, str]]:
+    results = {}
+
+    for offset, prompt in enumerate(prompts):
+        try:
+            response = await asyncio.to_thread(
+                genai_model.generate_content,
+                contents=[{"role": "user", "parts": [prompt]}],
+                generation_config={"response_mime_type": "application/json"},
+            )
+            content = getattr(response, "text", None) or response.candidates[0].content.parts[0].text
+            content = _sanitize_llm_output(content)
+            parsed = json.loads(content)
+
+            for i in range(1, 100):
+                q_key = f"Q{i}"
+                if q_key not in parsed:
+                    break
+                # ✅ Fix: Check if parsed[q_key] is a dict before calling .get()
+                if isinstance(parsed[q_key], dict):
+                    answer = parsed[q_key].get("answer", "").strip()
+                else:
+                    answer = str(parsed[q_key]).strip()
+
+                if answer and len(answer) > 5:
+                    results[q_key] = {"answer": answer}
+                else:
+                    results[q_key] = {"answer": "No matching clause found."}
+
+            if hasattr(response, "usage_metadata"):
+                print(f"🔢 Tokens used in batch {offset + 1}: {response.usage_metadata.total_token_count}")
+
+        except Exception as e:
+            print(f"❌ Gemini batch {offset + 1} failed:", e)
+            for i in range(len(prompts)):
+                results[f"Q{offset + i + 1}"] = {"answer": "An error occurred while generating the answer."}
+
+    return results
