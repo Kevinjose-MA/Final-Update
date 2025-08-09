@@ -12,4 +12,8 @@ python-docx
 google-generativeai==0.5.4
 torch==2.7.1+cpu
 python-dotenv
-
+googletrans==4.0.0rc1
+googletrans-py
+legacy-cgi
+langdetect
+language-tool-python

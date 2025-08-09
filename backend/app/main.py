@@ -22,6 +22,37 @@ import re
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse  # ✅ for document URL detection
+from langdetect import detect
+from googletrans import Translator
+from textblob import Word
+
+
+translator = Translator()
+def ensure_english(text, correct_typos=True):
+    try:
+        lang = detect(text)
+        # Translate only if not English
+        if lang != "en":
+            text = translator.translate(text, dest="en").text
+        
+        # Correct typos only if English AND allowed
+        if correct_typos and detect(text) == "en":
+            words = text.split()
+            corrected_words = []
+            for w in words:
+                if len(w) > 4 and not w.isupper():  # skip acronyms and proper nouns
+                    corrected_words.append(str(Word(w).correct()))
+                else:
+                    corrected_words.append(w)
+            return " ".join(corrected_words)
+        
+        return text
+
+    except Exception as e:
+        print(f"[Translation/Correction Error] {e}")
+        return text
+
+
 
 # Load env vars
 load_dotenv()
@@ -446,6 +477,15 @@ async def hackrx_run(req: HackRxRequest):
     for q in req.questions:
         print(f"   - {q}")
 
+    # --- NEW: translate incoming questions to English for better retrieval accuracy
+    # ensure_english is defined at top-level (see below)
+    try:
+        # Questions → translate and correct typos
+        req.questions = [ensure_english(q, correct_typos=True) for q in req.questions]
+
+    except Exception as e:
+        print(f"[Question translation error] {e}")
+
     doc_urls = req.documents if isinstance(req.documents, list) else [req.documents]
 
 
@@ -661,13 +701,19 @@ async def hackrx_run(req: HackRxRequest):
 
     with open(QA_CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(qa_cache, f, indent=2)
-
+    
+    
+    
     answers_map = {}
     for sq, orig_q in original_map.items():
         answers_map.setdefault(orig_q, []).append(qa_cache.get(sq, "No answer found."))
 
     final_answers = [" ".join(answers_map.get(q, ["No answer found."])) for q in req.questions]
     final_answers = [handle_dynamic_get_requests(ans) for ans in final_answers]
+    
+    # 🔹 Apply translation only to answers (not to questions)
+    # Answers → translate only, no typo correction (to avoid changing names like Trump)
+    final_answers = [ensure_english(ans, correct_typos=False) for ans in final_answers]
 
     print("\n📤 Final Answers:")
     for ans in final_answers:
@@ -681,6 +727,8 @@ async def warmup_model():
     print("🔥 Warming up Gemini and FAISS...")
     app.state.cache_indices = {}
 
+    # ensure clause_cache exists before listing
+    os.makedirs("clause_cache", exist_ok=True)
     clause_dir = "clause_cache"
     for filename in os.listdir(clause_dir):
         if filename.endswith(".json"):
@@ -721,7 +769,6 @@ async def warmup_model():
                 "clauses": clause_texts
             }
             print(f"✅ Loaded FAISS index for {filename} with {len(clause_texts)} enriched clauses")
-
 
 if __name__ == "__main__":
     import uvicorn
