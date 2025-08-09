@@ -234,9 +234,9 @@ async def retrieve_clauses_parallel(questions, index, clause_texts):
     }
 
     def process(q):
-        MIN_SIMILARITY = 0.55
+        MIN_SIMILARITY = 0.50  # relaxed threshold for better recall
         question_embedding = model.encode([q], convert_to_numpy=True)
-        D, I = index.search(np.array(question_embedding).astype(np.float32), k=35)
+        D, I = index.search(np.array(question_embedding).astype(np.float32), k=50)  # search more candidates
         faiss_matches = []
         for idx, dist in zip(I[0], D[0]):
             if idx < len(clause_texts):
@@ -254,19 +254,32 @@ async def retrieve_clauses_parallel(questions, index, clause_texts):
             all_candidates.append((clause, hybrid))
 
         sorted_clauses = [c for c, _ in sorted(all_candidates, key=lambda x: x[1], reverse=True)]
-        if len(sorted_clauses) < 5:
-            fallback_matches = [c["clause"] for c in clause_texts if any(t in c["clause"].lower() for t in tags)]
+
+        # Tag-based fallback
+        if len(sorted_clauses) < 5 and tags:
+            fallback_matches = [
+                c["clause"] for c in clause_texts
+                if any(t in c["clause"].lower() for t in tags)
+            ]
             sorted_clauses += [c for c in fallback_matches if c not in sorted_clauses]
 
-        if not sorted_clauses:
+        # Keyword-based fallback
+        if len(sorted_clauses) < 5:
             print(f"⚠ No strong match for: {q}")
-            fallback = [c["clause"] for c in clause_texts if any(k in c["clause"].lower() for k in extract_keywords(q))]
-            sorted_clauses = fallback[:10]
+            fallback = [
+                c["clause"] for c in clause_texts
+                if any(k in c["clause"].lower() for k in keywords)
+            ]
+            sorted_clauses += [c for c in fallback if c not in sorted_clauses]
 
+        # Always ensure we have some clauses
+        if not sorted_clauses:
+            sorted_clauses = [c["clause"] for c in clause_texts[:5]]
 
         if faiss_matches:
             print(f"[{q[:40]}...] Top FAISS score: {faiss_matches[0][1]:.3f}")
 
+        # Document-specific match boosting
         if any(k in q.lower() for k in [
             "documents", "upload", "submit", "claim form", "hospitalization",
             "settle", "reimburse", "reimbursement", "amount", "paid", "payment"
@@ -283,6 +296,7 @@ async def retrieve_clauses_parallel(questions, index, clause_texts):
                 if clause not in sorted_clauses:
                     sorted_clauses.append(clause)
 
+        # Trim to token limit
         top_trimmed = sorted_clauses[:15]
         per_question_token_limit = min(2500, max(30000 // len(questions), 800))
         print(f"📊 [{q[:40]}...] → using {per_question_token_limit} tokens")
@@ -302,16 +316,17 @@ async def retrieve_clauses_parallel(questions, index, clause_texts):
                 "tags": meta.get("tags", extract_tags(text))
             })
 
-        return q, enriched
+        return q, enriched or []  # always return a list
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = [loop.run_in_executor(executor, process, q) for q in questions]
         results = await asyncio.gather(*futures)
 
     for question, enriched_clauses in results:
-        question_clause_map[question] = enriched_clauses
+        question_clause_map[question] = enriched_clauses or []  # ensure no None
 
     return question_clause_map
+
 
 def build_prompt_batch(question_clause_map: Dict[str, List[Dict[str, str]]]) -> str:
     prompt_entries = []
@@ -392,6 +407,32 @@ async def call_llm(prompt: str, offset: int, batch_size: int) -> Dict[str, Dict[
             f"Q{offset + i + 1}": {"answer": "An error occurred while generating the answer."}
             for i in range(batch_size)
         }
+    
+def extract_best_sentence(question: str, clauses: List[Dict[str, str]]) -> str:
+    """
+    Given a question and a list of clause dicts (with "clause" keys),
+    return the single most relevant sentence from them.
+    """
+    keywords = extract_keywords(question)
+    best_sentence = None
+    best_score = 0
+
+    for clause_obj in clauses:
+        clause_text = clause_obj.get("clause", "")
+        # Split into sentences
+        sentences = re.split(r'(?<=[.!?])\s+', clause_text)
+        for sentence in sentences:
+            sentence_lower = sentence.lower()
+            score = sum(1 for kw in keywords if kw in sentence_lower)
+            # Small boost if all keywords are present
+            if score and all(kw in sentence_lower for kw in keywords):
+                score += 1
+            if score > best_score:
+                best_score = score
+                best_sentence = sentence.strip()
+
+    return best_sentence if best_sentence else None
+
 
 @app.get("/health")
 def health_check():
@@ -407,7 +448,10 @@ async def hackrx_run(req: HackRxRequest):
 
     doc_urls = req.documents if isinstance(req.documents, list) else [req.documents]
 
+
     all_clauses = []
+    
+    flight_number_result = None  # ✅ Store flight number if found
 
     for url in doc_urls:
         try:
@@ -427,39 +471,6 @@ async def hackrx_run(req: HackRxRequest):
                         print(f"⚠ Skipping invalid document: {url}")
                         continue
                 all_clauses.extend(clauses)
-                flight_number_result = None  # ✅ Store flight number if found
-
-                            # ✅ Check every clause for hackrx.in API calls before LLM
-            for clause_obj in all_clauses:
-                urls_in_clause = re.findall(r"https?://\S+", clause_obj.get("clause", ""))
-                for api_url in urls_in_clause:
-                    if "hackrx.in" in api_url:
-                        try:
-                            print(f"🌐 Direct API call detected from clause: {api_url}")
-                            resp = requests.get(api_url, timeout=10)
-                            if resp.status_code == 200:
-                                try:
-                                    data = resp.json()
-
-                                    # ✅ Known keys: flightNumber, token, secret, city
-                                    if "data" in data and isinstance(data["data"], dict):
-                                        for key in ["flightNumber", "token", "secret", "city"]:
-                                            if key in data["data"]:
-                                                return {"answers": [str(data["data"][key]).strip()]}
-
-                                    for key in ["flightNumber", "token", "secret", "city"]:
-                                        if key in data:
-                                            return {"answers": [str(data[key]).strip()]}
-
-                                    # fallback: return raw json
-                                    return {"answers": [json.dumps(data)]}
-
-                                except ValueError:
-                                    # not JSON, return plain text
-                                    return {"answers": [resp.text.strip()]}
-                        except Exception as e:
-                            print(f"❌ API fetch failed for {api_url}: {e}")
-
                 
 
             for clause_obj in all_clauses:
@@ -591,8 +602,8 @@ async def hackrx_run(req: HackRxRequest):
 
                                 # fallback
                                 return {"answers": [json.dumps(data)]}
-                            except ValueError:
-                                return {"answers": [resp.text.strip()]}
+                            except Exception:
+                                return {"answers": [str(resp.text).strip()]}
 
                     except Exception as e:
                         print(f"❌ Error fetching direct API from clause: {e}")
@@ -627,6 +638,11 @@ async def hackrx_run(req: HackRxRequest):
 
     uncached_questions = [q for q in split_questions if q not in qa_cache]
     question_clause_map = await retrieve_clauses_parallel(uncached_questions, index, clause_texts)
+
+    for q in uncached_questions:
+        best_sentence = extract_best_sentence(q, question_clause_map[q])
+        qa_cache[q] = best_sentence if best_sentence else "No matching clause found"
+
 
     # 🔹 Call LLM in batches
     batch_size = 15
