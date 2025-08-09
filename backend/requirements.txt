@@ -16,3 +16,4 @@ googletrans-py
 legacy-cgi
 langdetect
 language-tool-python
+textblob
