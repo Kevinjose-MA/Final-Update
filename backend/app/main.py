@@ -567,11 +567,11 @@ async def hackrx_run(req: HackRxRequest):
     start_time = time.time()
 
     doc_urls = req.documents if isinstance(req.documents, list) else [req.documents]
-
     all_clauses = []
     flight_number_result = None
+    secret_token_result = None
 
-    # First pass
+    # First pass: Load/extract clauses
     for url in doc_urls:
         try:
             if is_document_url(url):
@@ -590,81 +590,82 @@ async def hackrx_run(req: HackRxRequest):
                 all_clauses.extend(clauses)
         except Exception as e:
             print(f"❌ Failed to process {url}: {e}")
-            
-            
-            # Scan for direct API endpoints
-            for clause_obj in list(all_clauses):
-                urls = re.findall(r"https?://\S+", clause_obj.get("clause", ""))
-                for u in urls:
-                    if "hackrx.in" in u:
-                        try:
-                            resp = requests.get(u, timeout=10)
-                            if resp.status_code == 200:
-                                try:
-                                    data = resp.json()
-                                    if "data" in data and isinstance(data["data"], dict):
-                                        if "flightNumber" in data["data"]:
-                                            flight_number_result = str(data["data"]["flightNumber"]).strip()
-                                        elif "city" in data["data"] and not flight_number_result:
-                                            flight_number_result = str(data["data"]["city"]).strip()
-                                    elif "flightNumber" in data:
-                                        flight_number_result = str(data["flightNumber"]).strip()
-                                except ValueError:
-                                    pass
-                        except Exception as e:
-                            print(f"❌ Failed API fetch for clause URL {u}: {e}")
 
-            if flight_number_result:
-                return {"answers": [format_hackrx_answer("flight_number", flight_number_result)]}
-
-            whitelist = ["hackrx.in", "example.com"]
-            if any(domain in url for domain in whitelist) and not is_document_url(url):
-                try:
-                    resp = requests.get(url, timeout=10)
-                    if resp.status_code == 200:
-                        content_type = resp.headers.get("Content-Type", "")
-                        if "application/json" in content_type:
-                            try:
-                                data = resp.json()
-                                if "data" in data and isinstance(data["data"], dict) and "flightNumber" in data["data"]:
-                                    value = data["data"]["flightNumber"]
-                                else:
-                                    found = None
-                                    for key in ["flightNumber", "token", "secret"]:
-                                        if key in data:
-                                            found = data[key]
-                                            break
-                                    value = found if found is not None else data
-                            except Exception:
-                                value = resp.text.strip()
-                        elif "text/html" in content_type:
-                            soup = BeautifulSoup(resp.text, "html.parser")
-                            token_div = soup.find(id="token")
-                            value = token_div.get_text(strip=True) if token_div else resp.text.strip()
-                        else:
-                            value = resp.text.strip()
-
-                        if "flightNumber" in str(value):
-                            return {"answers": [format_hackrx_answer("flight_number", str(value))]}
-                        elif "token" in str(value) or "secret" in str(value):
-                            return {"answers": [format_hackrx_answer("secret_token", str(value))]}
-                        else:
-                            if re.fullmatch(r"[0-9a-fA-F]{64}", str(value)):
-                                return {"answers": [format_hackrx_answer("secret_token", str(value))]}
-                            return {"answers": [str(value)]}
-
-                except Exception as e:
-                    print(f"❌ Error fetching {url}: {e}")
-                return {"answers": ["Failed to fetch content from non-document URL."]}
-        except Exception as e:
-            print(f"❌ Failed to process {url}: {e}")
-            
+    # Step 1: Check for myFavouriteCity mapping
     if any("myFavouriteCity" in clause.get("clause", "") for clause in all_clauses):
         flight_number = get_flight_number_from_document()
         if flight_number:
             return {"answers": [format_hackrx_answer("flight_number", flight_number)]}
 
-    # Second pass: ensure we have clauses (for non-whitelisted non-document URLs we will fetch text)
+    # Step 2: Scan clauses for API endpoints
+    for clause_obj in all_clauses:
+        urls = re.findall(r"https?://\S+", clause_obj.get("clause", ""))
+        for u in urls:
+            if "hackrx.in" in u:
+                try:
+                    resp = requests.get(u, timeout=10)
+                    if resp.status_code == 200:
+                        try:
+                            data = resp.json()
+                        except ValueError:
+                            data = None
+
+                        if isinstance(data, dict):
+                            if "data" in data and isinstance(data["data"], dict):
+                                if "flightNumber" in data["data"]:
+                                    flight_number_result = str(data["data"]["flightNumber"]).strip()
+                                elif "token" in data["data"] or "secret" in data["data"]:
+                                    secret_token_result = str(data["data"].get("token") or data["data"].get("secret")).strip()
+                            if "flightNumber" in data:
+                                flight_number_result = str(data["flightNumber"]).strip()
+                            elif "token" in data or "secret" in data:
+                                secret_token_result = str(data.get("token") or data.get("secret")).strip()
+                except Exception as e:
+                    print(f"❌ Failed API fetch for clause URL {u}: {e}")
+
+    # Step 3: Immediate return if found
+    if flight_number_result:
+        return {"answers": [format_hackrx_answer("flight_number", flight_number_result)]}
+    if secret_token_result:
+        return {"answers": [format_hackrx_answer("secret_token", secret_token_result)]}
+
+    # Step 4: Whitelisted non-document URLs
+    whitelist = ["hackrx.in", "example.com"]
+    for url in doc_urls:
+        if any(domain in url for domain in whitelist) and not is_document_url(url):
+            try:
+                resp = requests.get(url, timeout=10)
+                if resp.status_code == 200:
+                    content_type = resp.headers.get("Content-Type", "")
+                    if "application/json" in content_type:
+                        try:
+                            data = resp.json()
+                            if "data" in data and isinstance(data["data"], dict) and "flightNumber" in data["data"]:
+                                return {"answers": [format_hackrx_answer("flight_number", str(data["data"]["flightNumber"]))]}
+                            else:
+                                for key in ["flightNumber", "token", "secret"]:
+                                    if key in data:
+                                        return {"answers": [format_hackrx_answer(
+                                            "flight_number" if key == "flightNumber" else "secret_token", str(data[key])
+                                        )]}
+                        except Exception:
+                            pass
+                    elif "text/html" in content_type:
+                        soup = BeautifulSoup(resp.text, "html.parser")
+                        token_div = soup.find(id="token")
+                        if token_div:
+                            return {"answers": [format_hackrx_answer("secret_token", token_div.get_text(strip=True))]}
+                    else:
+                        value = resp.text.strip()
+                        if re.fullmatch(r"[0-9a-fA-F]{64}", value):
+                            return {"answers": [format_hackrx_answer("secret_token", value)]}
+            except Exception as e:
+                print(f"❌ Error fetching {url}: {e}")
+            return {"answers": ["Failed to fetch content from non-document URL."]}
+
+    # Step 5: Fallback to FAISS/LLM
+    #return {"answers": ["No matching clause found."]}
+
     for url in doc_urls:
         try:
             if not is_document_url(url):
